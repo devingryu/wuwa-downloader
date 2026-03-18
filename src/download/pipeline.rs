@@ -3,6 +3,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 
+use async_channel::{Receiver, Sender};
 use indicatif::ProgressBar;
 use reqwest::Client;
 use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
@@ -16,7 +17,8 @@ use crate::io::logging::{SharedLogFile, log_error};
 use crate::network::client::download_file;
 
 const MAX_PIPELINE_RETRIES: usize = 2;
-const WORKER_CHANNEL_CAPACITY: usize = 16;
+const MIN_PIPELINE_QUEUE_CAPACITY: usize = 16;
+const DISPLAY_FILENAME_LIMIT: usize = 11;
 
 pub struct DownloadTask {
     pub item: ResourceItem,
@@ -84,14 +86,24 @@ async fn remove_file_if_exists(path: &Path) {
     }
 }
 
+fn display_filename(dest: &str) -> String {
+    let filename = dest.rsplit(['/', '\\']).next().unwrap_or(dest);
+    let truncated: String = filename.chars().take(DISPLAY_FILENAME_LIMIT).collect();
+    if filename.chars().count() > DISPLAY_FILENAME_LIMIT {
+        format!("{}...", truncated)
+    } else {
+        filename.to_string()
+    }
+}
+
 async fn verification_worker(
-    mut rx: mpsc::Receiver<ResourceItem>,
+    rx: Receiver<ResourceItem>,
     event_tx: UnboundedSender<PipelineEvent>,
     folder: PathBuf,
     should_stop: Arc<AtomicBool>,
     verify_bar: ProgressBar,
 ) {
-    while let Some(item) = rx.recv().await {
+    while let Ok(item) = rx.recv().await {
         if should_stop.load(Ordering::SeqCst) {
             break;
         }
@@ -130,7 +142,7 @@ async fn verification_worker(
 #[allow(clippy::too_many_arguments)]
 async fn download_worker(
     worker_id: usize,
-    mut rx: mpsc::Receiver<DownloadTask>,
+    rx: Receiver<DownloadTask>,
     event_tx: UnboundedSender<PipelineEvent>,
     client: Arc<Client>,
     config: Arc<Config>,
@@ -140,7 +152,7 @@ async fn download_worker(
     progress: DownloadProgress,
     display: Arc<ProgressDisplay>,
 ) {
-    while let Some(task) = rx.recv().await {
+    while let Ok(task) = rx.recv().await {
         if should_stop.load(Ordering::SeqCst) {
             break;
         }
@@ -149,13 +161,7 @@ async fn download_worker(
         let task_bar = display.slot_pool.bar(slot_index);
         task_bar.set_prefix(format!("DL {:02}", slot_index + 1));
 
-        let filename = task
-            .item
-            .dest
-            .rsplit(['/', '\\'])
-            .next()
-            .unwrap_or(task.item.dest.as_str())
-            .to_string();
+        let filename = display_filename(&task.item.dest);
 
         if task.attempt > 0 {
             task_bar.set_message(format!(
@@ -223,7 +229,7 @@ async fn download_worker(
 #[allow(clippy::too_many_arguments)]
 async fn post_verify_worker(
     worker_id: usize,
-    mut rx: mpsc::Receiver<PostVerifyTask>,
+    rx: Receiver<PostVerifyTask>,
     event_tx: UnboundedSender<PipelineEvent>,
     folder: PathBuf,
     log_file: SharedLogFile,
@@ -231,24 +237,14 @@ async fn post_verify_worker(
     progress: DownloadProgress,
     display: Arc<ProgressDisplay>,
 ) {
-    while let Some(task) = rx.recv().await {
-        let filename = task
-            .item
-            .dest
-            .rsplit(['/', '\\'])
-            .next()
-            .unwrap_or(task.item.dest.as_str())
-            .to_string();
+    while let Ok(task) = rx.recv().await {
+        let filename = display_filename(&task.item.dest);
         let path = folder.join(task.item.dest.replace('\\', "/"));
 
         if should_stop.load(Ordering::SeqCst) {
             let _ = event_tx.send(PipelineEvent::PostVerifyAborted);
             break;
         }
-
-        display
-            .status_bar
-            .set_message(format!("verifying {}", filename));
 
         let verified = if let Some(expected_md5) = task.item.md5.as_deref() {
             match calculate_md5_interruptible(&path, should_stop.clone()).await {
@@ -306,6 +302,20 @@ async fn post_verify_worker(
     }
 }
 
+fn pipeline_queue_capacity(verify_concurrency: usize, download_concurrency: usize) -> usize {
+    verify_concurrency
+        .max(download_concurrency)
+        .saturating_mul(4)
+        .max(MIN_PIPELINE_QUEUE_CAPACITY)
+}
+
+async fn enqueue_task<T>(tx: &Sender<T>, task: T) -> Result<(), T> {
+    match tx.send(task).await {
+        Ok(()) => Ok(()),
+        Err(err) => Err(err.0),
+    }
+}
+
 pub async fn run_pipeline(
     client: Arc<Client>,
     config: Arc<Config>,
@@ -319,6 +329,7 @@ pub async fn run_pipeline(
     let verify_concurrency = options.verify_concurrency.max(1);
     let download_concurrency = options.download_concurrency.max(1);
     let post_verify_concurrency = verify_concurrency;
+    let queue_capacity = pipeline_queue_capacity(verify_concurrency, download_concurrency);
 
     let total_download_size: u64 = resources.iter().filter_map(|item| item.size).sum();
     let display = Arc::new(ProgressDisplay::new(
@@ -334,29 +345,27 @@ pub async fn run_pipeline(
 
     let (event_tx, mut event_rx): (UnboundedSender<PipelineEvent>, UnboundedReceiver<PipelineEvent>) =
         mpsc::unbounded_channel();
+    let (verify_tx, verify_rx) = async_channel::bounded(queue_capacity);
+    let (download_tx, download_rx) = async_channel::bounded(queue_capacity);
+    let (post_verify_tx, post_verify_rx) = async_channel::bounded(queue_capacity);
 
-    let mut verify_txs = Vec::with_capacity(verify_concurrency);
     let mut verify_handles = Vec::with_capacity(verify_concurrency);
     for _ in 0..verify_concurrency {
-        let (tx, rx) = mpsc::channel(WORKER_CHANNEL_CAPACITY);
-        verify_txs.push(tx);
         verify_handles.push(tokio::spawn(verification_worker(
-            rx,
+            verify_rx.clone(),
             event_tx.clone(),
             folder.clone(),
             should_stop.clone(),
             display.verify_bar.clone(),
         )));
     }
+    drop(verify_rx);
 
-    let mut download_txs = Vec::with_capacity(download_concurrency);
     let mut download_handles = Vec::with_capacity(download_concurrency);
     for worker_id in 0..download_concurrency {
-        let (tx, rx) = mpsc::channel(WORKER_CHANNEL_CAPACITY);
-        download_txs.push(tx);
         download_handles.push(tokio::spawn(download_worker(
             worker_id,
-            rx,
+            download_rx.clone(),
             event_tx.clone(),
             client.clone(),
             config.clone(),
@@ -367,15 +376,13 @@ pub async fn run_pipeline(
             display.clone(),
         )));
     }
+    drop(download_rx);
 
-    let mut post_verify_txs = Vec::with_capacity(post_verify_concurrency);
     let mut post_verify_handles = Vec::with_capacity(post_verify_concurrency);
     for worker_id in 0..post_verify_concurrency {
-        let (tx, rx) = mpsc::channel(WORKER_CHANNEL_CAPACITY);
-        post_verify_txs.push(tx);
         post_verify_handles.push(tokio::spawn(post_verify_worker(
             worker_id,
-            rx,
+            post_verify_rx.clone(),
             event_tx.clone(),
             folder.clone(),
             log_file.clone(),
@@ -384,14 +391,18 @@ pub async fn run_pipeline(
             display.clone(),
         )));
     }
+    drop(post_verify_rx);
 
-    for (idx, item) in resources.into_iter().enumerate() {
+    for item in resources {
         if should_stop.load(Ordering::SeqCst) {
             break;
         }
-        let _ = verify_txs[idx % verify_concurrency].send(item).await;
+        if enqueue_task(&verify_tx, item).await.is_err() {
+            break;
+        }
     }
-    drop(verify_txs);
+    drop(verify_tx);
+    drop(event_tx);
 
     let mut result = PipelineResult {
         verified_ok: 0,
@@ -400,25 +411,31 @@ pub async fn run_pipeline(
         total,
     };
     let mut active_tasks = total;
-    let mut download_rr = 0usize;
-    let mut post_verify_rr = 0usize;
+    let mut shutting_down = should_stop.load(Ordering::SeqCst);
+
     loop {
-        if active_tasks == 0 {
+        if !shutting_down && active_tasks == 0 {
             break;
         }
 
-        if should_stop.load(Ordering::SeqCst) {
+        if !shutting_down && should_stop.load(Ordering::SeqCst) {
+            shutting_down = true;
             display
                 .status_bar
-                .set_message(format!("shutdown: waiting for workers, left={}", active_tasks));
-            download_txs.clear();
-            post_verify_txs.clear();
-            break;
+                .set_message(format!("shutdown: left={}", active_tasks));
+            download_tx.close();
+            post_verify_tx.close();
         }
 
-        display
-            .status_bar
-            .set_message(format!("processing: {} files left", active_tasks));
+        if shutting_down {
+            display
+                .status_bar
+                .set_message(format!("shutdown: left={}", active_tasks));
+        } else {
+            display
+                .status_bar
+                .set_message(format!("processing: {} files left", active_tasks));
+        }
 
         tokio::select! {
             maybe_event = event_rx.recv() => {
@@ -435,26 +452,21 @@ pub async fn run_pipeline(
                         active_tasks = active_tasks.saturating_sub(1);
                     }
                     PipelineEvent::NeedDownload(task) => {
-                        if download_txs.is_empty() {
+                        if shutting_down {
                             continue;
                         }
-                        let idx = download_rr % download_txs.len();
-                        if download_txs[idx].send(task).await.is_ok() {
-                            download_rr = (download_rr + 1) % download_txs.len();
-                        } else {
+
+                        if enqueue_task(&download_tx, task).await.is_err() {
                             result.failed += 1;
                             active_tasks = active_tasks.saturating_sub(1);
                         }
                     }
                     PipelineEvent::DownloadSuccess(task) => {
-                        if post_verify_txs.is_empty() {
+                        if shutting_down {
                             continue;
                         }
 
-                        let idx = post_verify_rr % post_verify_txs.len();
-                        if post_verify_txs[idx].send(task).await.is_ok() {
-                            post_verify_rr = (post_verify_rr + 1) % post_verify_txs.len();
-                        } else {
+                        if enqueue_task(&post_verify_tx, task).await.is_err() {
                             result.failed += 1;
                             active_tasks = active_tasks.saturating_sub(1);
                         }
@@ -471,13 +483,11 @@ pub async fn run_pipeline(
                         active_tasks = active_tasks.saturating_sub(1);
                     }
                     PipelineEvent::NeedRetry(task) => {
-                        if download_txs.is_empty() {
+                        if shutting_down {
                             continue;
                         }
-                        let idx = download_rr % download_txs.len();
-                        if download_txs[idx].send(task).await.is_ok() {
-                            download_rr = (download_rr + 1) % download_txs.len();
-                        } else {
+
+                        if enqueue_task(&download_tx, task).await.is_err() {
                             result.failed += 1;
                             active_tasks = active_tasks.saturating_sub(1);
                         }
@@ -497,9 +507,8 @@ pub async fn run_pipeline(
         }
     }
 
-    drop(download_txs);
-    drop(post_verify_txs);
-    drop(event_tx);
+    drop(download_tx);
+    drop(post_verify_tx);
 
     for handle in verify_handles {
         let _ = handle.await;

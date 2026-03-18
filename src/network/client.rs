@@ -445,17 +445,15 @@ pub async fn download_file(
         task_pb.set_length(0);
     }
 
-    // === 사전 삭제 로직: 오염/초과 파일 감지 및 제거 ===
+    // Validate any existing file before deciding whether to resume or restart.
     let mut force_full_download = false;
     if let Some(expected) = expected_size {
         let local_size = file_size(&path).await;
         if local_size > 0 {
             if local_size == expected {
-                // 크기 동일 → MD5 검증
                 if let Some(md5) = expected_md5 {
                     match calculate_md5(&path).await {
                         Ok(actual) if actual == md5 => {
-                            // 이미 유효한 파일 → 스킵
                             task_pb.set_position(expected);
                             task_pb.set_message(format!(
                                 "already valid: {}",
@@ -464,7 +462,6 @@ pub async fn download_file(
                             return true;
                         }
                         _ => {
-                            // 해시 불일치 → 사전 삭제
                             log_error(
                                 log_file,
                                 &format!(
@@ -478,7 +475,6 @@ pub async fn download_file(
                         }
                     }
                 } else {
-                    // MD5 없고 크기 동일 → 유효로 간주
                     task_pb.set_position(expected);
                     task_pb.set_message(format!(
                         "already valid: {}",
@@ -487,7 +483,6 @@ pub async fn download_file(
                     return true;
                 }
             } else if local_size > expected {
-                // 로컬이 더 큼 → 삭제 후 새로 다운로드
                 log_error(
                     log_file,
                     &format!("Oversized file detected, deleting: {}", normalized_dest),
@@ -496,7 +491,6 @@ pub async fn download_file(
                 task_pb.set_position(0);
                 force_full_download = true;
             }
-            // local_size < expected → 기존 이어받기 로직 유지
         }
     }
 
