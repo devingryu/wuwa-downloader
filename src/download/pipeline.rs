@@ -53,39 +53,6 @@ enum PipelineEvent {
     PostVerifyAborted,
 }
 
-fn count_completed_bytes(progress: &DownloadProgress, total_bar: &ProgressBar, amount: u64) {
-    if amount == 0 {
-        return;
-    }
-
-    progress
-        .downloaded_bytes
-        .fetch_add(amount, Ordering::SeqCst);
-    total_bar.set_position(progress.downloaded());
-}
-
-fn rollback_completed_bytes(progress: &DownloadProgress, total_bar: &ProgressBar, amount: u64) {
-    if amount == 0 {
-        return;
-    }
-
-    let mut current = progress.downloaded_bytes.load(Ordering::SeqCst);
-    loop {
-        let next = current.saturating_sub(amount);
-        match progress.downloaded_bytes.compare_exchange(
-            current,
-            next,
-            Ordering::SeqCst,
-            Ordering::SeqCst,
-        ) {
-            Ok(_) => break,
-            Err(observed) => current = observed,
-        }
-    }
-
-    total_bar.set_position(progress.downloaded());
-}
-
 async fn remove_file_if_exists(path: &Path) {
     if tokio::fs::try_exists(path).await.unwrap_or(false) {
         let _ = tokio::fs::remove_file(path).await;
@@ -314,7 +281,9 @@ async fn post_verify_worker(
         }
 
         let bytes_to_rollback = file_size(&path).await;
-        rollback_completed_bytes(&progress, &display.total_bar, bytes_to_rollback);
+        progress
+            .rollback_downloaded_bytes(&display.total_bar, bytes_to_rollback)
+            .await;
         remove_file_if_exists(&path).await;
 
         if task.attempt < MAX_PIPELINE_RETRIES {
@@ -395,6 +364,7 @@ pub async fn run_pipeline(
     let progress = DownloadProgress {
         total_bytes: Arc::new(AtomicU64::new(total_download_size)),
         downloaded_bytes: Arc::new(AtomicU64::new(0)),
+        total_bar_lock: Arc::new(tokio::sync::Mutex::new(())),
         start_time: Instant::now(),
     };
 
@@ -518,7 +488,9 @@ pub async fn run_pipeline(
                 match event {
                     PipelineEvent::VerifiedValid { completed_bytes } => {
                         if let Some(bytes) = completed_bytes {
-                            count_completed_bytes(&progress, &display.total_bar, bytes);
+                            progress
+                                .add_downloaded_bytes(&display.total_bar, bytes)
+                                .await;
                         }
                         result.verified_ok += 1;
                         active_tasks = active_tasks.saturating_sub(1);

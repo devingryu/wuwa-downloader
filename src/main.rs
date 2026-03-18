@@ -130,10 +130,12 @@ async fn main() {
     )
     .await;
 
-    should_stop.store(true, Ordering::SeqCst);
-
     #[cfg(windows)]
     clear().unwrap();
 
     print_results(&result, &folder);
+
+    if should_stop.load(Ordering::SeqCst) {
+        std::process::exit(130);
+    }
 }

@@ -13,12 +13,48 @@ use tokio::sync::{Mutex, Notify};
 pub struct DownloadProgress {
     pub total_bytes: Arc<AtomicU64>,
     pub downloaded_bytes: Arc<AtomicU64>,
+    pub(crate) total_bar_lock: Arc<Mutex<()>>,
     pub start_time: Instant,
 }
 
 impl DownloadProgress {
     pub fn downloaded(&self) -> u64 {
         self.downloaded_bytes.load(Ordering::SeqCst)
+    }
+
+    pub async fn add_downloaded_bytes(&self, total_bar: &ProgressBar, amount: u64) {
+        if amount == 0 {
+            return;
+        }
+
+        let _guard = self.total_bar_lock.lock().await;
+        let next = self
+            .downloaded_bytes
+            .fetch_add(amount, Ordering::SeqCst)
+            .saturating_add(amount);
+        total_bar.set_position(next);
+    }
+
+    pub async fn rollback_downloaded_bytes(&self, total_bar: &ProgressBar, amount: u64) {
+        if amount == 0 {
+            return;
+        }
+
+        let _guard = self.total_bar_lock.lock().await;
+        let mut current = self.downloaded_bytes.load(Ordering::SeqCst);
+        let next = loop {
+            let next = current.saturating_sub(amount);
+            match self.downloaded_bytes.compare_exchange(
+                current,
+                next,
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+            ) {
+                Ok(_) => break next,
+                Err(observed) => current = observed,
+            }
+        };
+        total_bar.set_position(next);
     }
 }
 

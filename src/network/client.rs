@@ -134,7 +134,7 @@ async fn remove_partial_file(path: &Path) {
     }
 }
 
-fn rollback_counted_bytes(
+async fn rollback_counted_bytes(
     progress: &DownloadProgress,
     total_pb: &ProgressBar,
     counted_bytes_for_file: &mut u64,
@@ -144,27 +144,7 @@ fn rollback_counted_bytes(
         return;
     }
 
-    let mut current = progress
-        .downloaded_bytes
-        .load(std::sync::atomic::Ordering::SeqCst);
-    loop {
-        let next = current.saturating_sub(amount);
-        match progress.downloaded_bytes.compare_exchange(
-            current,
-            next,
-            std::sync::atomic::Ordering::SeqCst,
-            std::sync::atomic::Ordering::SeqCst,
-        ) {
-            Ok(_) => break,
-            Err(observed) => current = observed,
-        }
-    }
-
-    total_pb.set_position(
-        progress
-            .downloaded_bytes
-            .load(std::sync::atomic::Ordering::SeqCst),
-    );
+    progress.rollback_downloaded_bytes(total_pb, amount).await;
     *counted_bytes_for_file = 0;
 }
 
@@ -174,7 +154,7 @@ async fn wait_for_stop(should_stop: &AtomicBool) {
     }
 }
 
-fn count_total_progress(
+async fn count_total_progress(
     progress: &DownloadProgress,
     total_pb: &ProgressBar,
     counted_bytes_for_file: &mut u64,
@@ -184,10 +164,7 @@ fn count_total_progress(
         return;
     }
 
-    progress
-        .downloaded_bytes
-        .fetch_add(amount, std::sync::atomic::Ordering::SeqCst);
-    total_pb.inc(amount);
+    progress.add_downloaded_bytes(total_pb, amount).await;
     *counted_bytes_for_file += amount;
 }
 
@@ -251,7 +228,7 @@ async fn download_single_file(
         options.append(true);
         task_pb.set_position(local_size);
         if *counted_bytes_for_file == 0 {
-            count_total_progress(progress, total_pb, counted_bytes_for_file, local_size);
+            count_total_progress(progress, total_pb, counted_bytes_for_file, local_size).await;
         }
     } else {
         options.write(true).truncate(true);
@@ -283,7 +260,7 @@ async fn download_single_file(
 
         let size = chunk.len() as u64;
         task_pb.inc(size);
-        count_total_progress(progress, total_pb, counted_bytes_for_file, size);
+        count_total_progress(progress, total_pb, counted_bytes_for_file, size).await;
     }
 
     if let Err(e) = file.flush().await {
@@ -348,7 +325,7 @@ async fn try_download_with_cdns(
                     last_error = err;
                     retries -= 1;
                     if !allow_resume {
-                        rollback_counted_bytes(progress, total_pb, counted_bytes_for_file);
+                        rollback_counted_bytes(progress, total_pb, counted_bytes_for_file).await;
                         task_pb.set_position(0);
                     }
                     if retries > 0 {
@@ -362,7 +339,7 @@ async fn try_download_with_cdns(
                 DownloadAttemptResult::RangeNotSatisfiable => {
                     last_error = "Range not satisfiable, restarting file".to_string();
                     retries -= 1;
-                    rollback_counted_bytes(progress, total_pb, counted_bytes_for_file);
+                    rollback_counted_bytes(progress, total_pb, counted_bytes_for_file).await;
                     remove_partial_file(path).await;
                     task_pb.set_position(0);
                     task_pb.set_message(format!(
@@ -526,7 +503,7 @@ pub async fn download_file(
                 "CDN does not support resume, restarting {}",
                 filename.yellow()
             ));
-            rollback_counted_bytes(progress, total_pb, &mut counted_bytes_for_file);
+            rollback_counted_bytes(progress, total_pb, &mut counted_bytes_for_file).await;
             remove_partial_file(&path).await;
             task_pb.set_position(0);
 
@@ -874,7 +851,7 @@ pub async fn fetch_gist(client: &Client, should_stop: &AtomicBool) -> Result<Str
 
         let resp = match tokio::select! {
             _ = wait_for_stop(should_stop) => return Err(interrupted_error("loading version metadata")),
-            resp = client.get(&index_url).send() => resp,
+            resp = client.get(&index_url).timeout(Duration::from_secs(30)).send() => resp,
         } {
             Ok(resp) => resp,
             Err(e) => {
