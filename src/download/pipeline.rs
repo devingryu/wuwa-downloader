@@ -17,7 +17,6 @@ use crate::io::logging::{SharedLogFile, log_error};
 use crate::network::client::download_file;
 
 const MAX_PIPELINE_RETRIES: usize = 2;
-const MIN_PIPELINE_QUEUE_CAPACITY: usize = 16;
 const DISPLAY_FILENAME_LIMIT: usize = 11;
 
 pub struct DownloadTask {
@@ -302,13 +301,6 @@ async fn post_verify_worker(
     }
 }
 
-fn pipeline_queue_capacity(verify_concurrency: usize, download_concurrency: usize) -> usize {
-    verify_concurrency
-        .max(download_concurrency)
-        .saturating_mul(4)
-        .max(MIN_PIPELINE_QUEUE_CAPACITY)
-}
-
 async fn enqueue_task<T>(tx: &Sender<T>, task: T) -> Result<(), T> {
     match tx.send(task).await {
         Ok(()) => Ok(()),
@@ -330,7 +322,6 @@ pub async fn run_pipeline(
     let verify_concurrency = options.verify_concurrency.max(1);
     let download_concurrency = options.download_concurrency.max(1);
     let post_verify_concurrency = verify_concurrency;
-    let queue_capacity = pipeline_queue_capacity(verify_concurrency, download_concurrency);
 
     let mut items_to_verify = Vec::new();
     let mut items_to_download = Vec::new();

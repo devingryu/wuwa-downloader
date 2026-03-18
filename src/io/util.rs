@@ -39,11 +39,21 @@ pub fn parse_resources(data: &Value) -> Result<Vec<ResourceItem>, String> {
 
 pub fn ask_concurrency() -> DownloadOptions {
     let defaults = DownloadOptions::default();
+    let download_concurrency = prompt_concurrency("concurrent downloads", defaults.download_concurrency);
+    let verify_concurrency = prompt_concurrency("concurrent verifications", defaults.verify_concurrency);
 
+    DownloadOptions {
+        download_concurrency,
+        verify_concurrency,
+    }
+}
+
+fn prompt_concurrency(label: &str, default_value: usize) -> usize {
     print!(
-        "{} Enter concurrent downloads [default {}]: ",
+        "{} Enter {} [default {}]: ",
         Status::question(),
-        defaults.download_concurrency
+        label,
+        default_value
     );
     io::stdout().flush().unwrap();
 
@@ -51,26 +61,23 @@ pub fn ask_concurrency() -> DownloadOptions {
     if io::stdin().read_line(&mut input).is_ok() {
         let trimmed = input.trim();
         if trimmed.is_empty() {
-            return defaults;
+            return default_value;
         }
 
         if let Ok(parsed) = trimmed.parse::<usize>()
             && parsed > 0
         {
-            return DownloadOptions {
-                download_concurrency: parsed,
-                ..defaults
-            };
+            return parsed;
         }
     }
 
     println!(
-        "{} Invalid value, using default concurrency {}",
+        "{} Invalid value, using default {} for {}",
         Status::warning(),
-        defaults.download_concurrency
+        default_value,
+        label
     );
-
-    defaults
+    default_value
 }
 
 pub fn get_version(data: &Value, category: &str, version: &str) -> Result<String, String> {
