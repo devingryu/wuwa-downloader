@@ -16,12 +16,17 @@ pub fn print_results(result: &PipelineResult, folder: &Path) {
 
     println!("\n{}\n", title);
     println!(
-        "{} Successfully downloaded: {}",
+        "{} Successfully verified: {}",
         Status::success(),
-        success.to_string().green()
+        result.verified_ok.to_string().green()
     );
     println!(
-        "{} Failed downloads: {}",
+        "{} Successfully downloaded: {}",
+        Status::success(),
+        result.downloaded_ok.to_string().green()
+    );
+    println!(
+        "{} Failed: {}",
         Status::error(),
         result.failed.to_string().red()
     );

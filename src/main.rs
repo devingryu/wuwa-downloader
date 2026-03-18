@@ -3,6 +3,7 @@ use reqwest::Client;
 
 #[cfg(not(target_os = "windows"))]
 use std::process::Command;
+use std::sync::atomic::Ordering;
 
 #[cfg(windows)]
 use winconsole::console::{clear, set_title};
@@ -59,14 +60,28 @@ async fn main() {
 
     let log_file = setup_logging();
     let client = Client::new();
+    let should_stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    setup_ctrlc(should_stop.clone());
 
-    let config = match get_config(&client).await {
+    let config = match get_config(&client, &should_stop).await {
         Ok(c) => c,
+        Err(_) if should_stop.load(Ordering::SeqCst) => std::process::exit(130),
         Err(e) => exit_with_error(&log_file, &e),
     };
 
-    let folder = get_dir();
-    let options = ask_concurrency();
+    let folder = match get_dir(&should_stop) {
+        Ok(folder) => folder,
+        Err(_) if should_stop.load(Ordering::SeqCst) => std::process::exit(130),
+        Err(e) => exit_with_error(
+            &log_file,
+            &format!("Failed to read download directory: {}", e),
+        ),
+    };
+    let options = match ask_concurrency(&should_stop) {
+        Ok(options) => options,
+        Err(_) if should_stop.load(Ordering::SeqCst) => std::process::exit(130),
+        Err(e) => exit_with_error(&log_file, &format!("Failed to read concurrency: {}", e)),
+    };
 
     #[cfg(windows)]
     clear().unwrap();
@@ -89,7 +104,11 @@ async fn main() {
         options.verify_concurrency.to_string().cyan()
     );
 
-    let data = fetch_index(&client, &config, &log_file).await;
+    let data = match fetch_index(&client, &config, &log_file, &should_stop).await {
+        Ok(data) => data,
+        Err(_) if should_stop.load(Ordering::SeqCst) => std::process::exit(130),
+        Err(e) => exit_with_error(&log_file, &e),
+    };
     let resources = match parse_resources(&data) {
         Ok(resources) => resources,
         Err(err) => exit_with_error(&log_file, &err),
@@ -100,10 +119,6 @@ async fn main() {
         Status::info(),
         resources.len().to_string().cyan()
     );
-
-    let should_stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-    setup_ctrlc(should_stop.clone());
-
     let result = run_pipeline(
         std::sync::Arc::new(client),
         std::sync::Arc::new(config),
@@ -115,7 +130,7 @@ async fn main() {
     )
     .await;
 
-    should_stop.store(true, std::sync::atomic::Ordering::SeqCst);
+    should_stop.store(true, Ordering::SeqCst);
 
     #[cfg(windows)]
     clear().unwrap();

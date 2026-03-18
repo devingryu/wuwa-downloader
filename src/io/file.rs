@@ -8,6 +8,13 @@ use std::{
 };
 
 use crate::config::status::Status;
+use crate::io::util::read_line_interruptible;
+
+#[derive(Debug)]
+pub enum VerificationError {
+    Interrupted,
+    Io(io::Error),
+}
 
 fn calculate_md5_sync(path: &Path) -> io::Result<String> {
     calculate_md5_sync_interruptible(path, None)
@@ -53,12 +60,22 @@ pub async fn calculate_md5(path: &Path) -> Result<String, String> {
 pub async fn calculate_md5_interruptible(
     path: &Path,
     should_stop: Arc<AtomicBool>,
-) -> Result<String, String> {
+) -> Result<String, VerificationError> {
     let path_buf = path.to_path_buf();
-    tokio::task::spawn_blocking(move || calculate_md5_sync_interruptible(&path_buf, Some(should_stop)))
-        .await
-        .map_err(|e| format!("Failed to join MD5 task: {}", e))?
-        .map_err(|e| format!("Failed to calculate MD5: {}", e))
+    tokio::task::spawn_blocking(move || {
+        calculate_md5_sync_interruptible(&path_buf, Some(should_stop))
+    })
+    .await
+    .map_err(|e| {
+        VerificationError::Io(io::Error::other(format!("Failed to join MD5 task: {}", e)))
+    })?
+    .map_err(|e| match e.kind() {
+        io::ErrorKind::Interrupted => VerificationError::Interrupted,
+        _ => VerificationError::Io(io::Error::new(
+            e.kind(),
+            format!("Failed to calculate MD5: {}", e),
+        )),
+    })
 }
 
 pub async fn check_existing_file(
@@ -92,26 +109,28 @@ pub async fn check_existing_file_interruptible(
     expected_md5: Option<&str>,
     expected_size: Option<u64>,
     should_stop: Arc<AtomicBool>,
-) -> bool {
+) -> Result<bool, VerificationError> {
     let metadata = match tokio::fs::metadata(path).await {
         Ok(metadata) => metadata,
-        Err(_) => return false,
+        Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(false),
+        Err(err) => return Err(VerificationError::Io(err)),
     };
 
     if let Some(size) = expected_size
         && metadata.len() != size
     {
-        return false;
+        return Ok(false);
     }
 
     if let Some(md5) = expected_md5 {
         match calculate_md5_interruptible(path, should_stop).await {
             Ok(actual_md5) if actual_md5 == md5 => {}
-            _ => return false,
+            Ok(_) => return Ok(false),
+            Err(err) => return Err(err),
         }
     }
 
-    true
+    Ok(true)
 }
 
 pub async fn file_size(path: &Path) -> u64 {
@@ -129,7 +148,7 @@ pub fn get_filename(path: &str) -> String {
         .to_string()
 }
 
-pub fn get_dir() -> PathBuf {
+pub fn get_dir(should_stop: &AtomicBool) -> Result<PathBuf, io::Error> {
     loop {
         print!(
             "{} Please specify the directory where the game should be downloaded (press Enter to use the current directory): ",
@@ -137,8 +156,7 @@ pub fn get_dir() -> PathBuf {
         );
         io::stdout().flush().unwrap();
 
-        let mut input = String::new();
-        io::stdin().read_line(&mut input).unwrap();
+        let input = read_line_interruptible(should_stop)?;
         let path = input.trim();
 
         let path = if path.is_empty() {
@@ -148,7 +166,7 @@ pub fn get_dir() -> PathBuf {
         };
 
         if path.is_dir() {
-            return path;
+            return Ok(path);
         }
 
         print!(
@@ -157,12 +175,99 @@ pub fn get_dir() -> PathBuf {
         );
         io::stdout().flush().unwrap();
 
-        let mut input = String::new();
-        io::stdin().read_line(&mut input).unwrap();
+        let input = read_line_interruptible(should_stop)?;
 
         if input.trim().eq_ignore_ascii_case("y") {
             fs::create_dir_all(&path).unwrap();
-            return path;
+            return Ok(path);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{VerificationError, check_existing_file_interruptible};
+    use std::fs;
+    use std::path::PathBuf;
+    use std::sync::Arc;
+    use std::sync::atomic::AtomicBool;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn unique_path(name: &str) -> PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        std::env::temp_dir().join(format!("wuwa-downloader-{name}-{nanos}"))
+    }
+
+    #[tokio::test]
+    async fn check_existing_file_interruptible_returns_false_for_size_mismatch() {
+        let path = unique_path("size-mismatch");
+        fs::write(&path, b"abc").unwrap();
+
+        let result = check_existing_file_interruptible(
+            &path,
+            None,
+            Some(4),
+            Arc::new(AtomicBool::new(false)),
+        )
+        .await
+        .unwrap();
+
+        assert!(!result);
+        let _ = fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn check_existing_file_interruptible_returns_false_for_checksum_mismatch() {
+        let path = unique_path("checksum-mismatch");
+        fs::write(&path, b"abc").unwrap();
+
+        let result = check_existing_file_interruptible(
+            &path,
+            Some("deadbeef"),
+            Some(3),
+            Arc::new(AtomicBool::new(false)),
+        )
+        .await
+        .unwrap();
+
+        assert!(!result);
+        let _ = fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn check_existing_file_interruptible_propagates_interruptions() {
+        let path = unique_path("interrupted");
+        fs::write(&path, b"abc").unwrap();
+
+        let result = check_existing_file_interruptible(
+            &path,
+            Some("900150983cd24fb0d6963f7d28e17f72"),
+            Some(3),
+            Arc::new(AtomicBool::new(true)),
+        )
+        .await;
+
+        assert!(matches!(result, Err(VerificationError::Interrupted)));
+        let _ = fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn check_existing_file_interruptible_propagates_io_failures() {
+        let path = unique_path("io-failure");
+        fs::create_dir(&path).unwrap();
+
+        let result = check_existing_file_interruptible(
+            &path,
+            Some("900150983cd24fb0d6963f7d28e17f72"),
+            None,
+            Arc::new(AtomicBool::new(false)),
+        )
+        .await;
+
+        assert!(matches!(result, Err(VerificationError::Io(_))));
+        let _ = fs::remove_dir(path);
     }
 }

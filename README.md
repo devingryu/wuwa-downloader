@@ -61,14 +61,16 @@ cargo build --release
 1. Select a version to download (Live/Beta and OS/CN)
 2. Choose a download directory or press Enter for current directory
 3. Enter the number of concurrent download workers or press Enter to use the default
-4. Wait for the index file to be fetched and parsed
-5. Monitor verification and download progress in the multi-bar UI
-6. Review the final summary:
+4. Enter the number of concurrent verification workers or press Enter to use the default
+5. Wait for the index file to be fetched and parsed
+6. Monitor verification and download progress in the multi-bar UI
+7. Review the final summary:
+   - Successfully verified
+   - Successfully downloaded
+   - Failed
+   - Unprocessed
    - Total files
-   - Successfully processed files
-   - Failed downloads
-   - Unprocessed files
-7. Press Enter to exit
+8. Press Enter to exit only when there are no unprocessed files
 
 ## 🔍 Technical Details
 ### How It Works

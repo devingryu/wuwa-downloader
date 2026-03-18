@@ -1,6 +1,6 @@
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Instant;
 
 use async_channel::{Receiver, Sender};
@@ -11,7 +11,7 @@ use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
 use crate::config::cfg::{Config, DownloadOptions, ResourceItem};
 use crate::download::progress::{DownloadProgress, ProgressDisplay};
 use crate::io::file::{
-    calculate_md5_interruptible, check_existing_file_interruptible, file_size,
+    VerificationError, calculate_md5_interruptible, check_existing_file_interruptible, file_size,
 };
 use crate::io::logging::{SharedLogFile, log_error};
 use crate::network::client::download_file;
@@ -21,13 +21,13 @@ const DISPLAY_FILENAME_LIMIT: usize = 11;
 
 pub struct DownloadTask {
     pub item: ResourceItem,
-    pub expected_size: u64,
+    pub expected_size: Option<u64>,
     pub attempt: usize,
 }
 
 pub struct PostVerifyTask {
     pub item: ResourceItem,
-    pub expected_size: u64,
+    pub expected_size: Option<u64>,
     pub attempt: usize,
 }
 
@@ -41,12 +41,15 @@ pub struct PipelineResult {
 enum PipelineEvent {
     VerifiedValid { completed_bytes: Option<u64> },
     NeedDownload(DownloadTask),
+    VerificationFailed { dest: String },
+    VerificationAborted,
     DownloadSuccess(PostVerifyTask),
     DownloadFailed { dest: String },
     DownloadAborted,
     PostVerifySuccess,
     NeedRetry(DownloadTask),
     PostVerifyFailed { dest: String },
+    PostVerifyIoFailed { dest: String },
     PostVerifyAborted,
 }
 
@@ -55,7 +58,9 @@ fn count_completed_bytes(progress: &DownloadProgress, total_bar: &ProgressBar, a
         return;
     }
 
-    progress.downloaded_bytes.fetch_add(amount, Ordering::SeqCst);
+    progress
+        .downloaded_bytes
+        .fetch_add(amount, Ordering::SeqCst);
     total_bar.set_position(progress.downloaded());
 }
 
@@ -67,10 +72,12 @@ fn rollback_completed_bytes(progress: &DownloadProgress, total_bar: &ProgressBar
     let mut current = progress.downloaded_bytes.load(Ordering::SeqCst);
     loop {
         let next = current.saturating_sub(amount);
-        match progress
-            .downloaded_bytes
-            .compare_exchange(current, next, Ordering::SeqCst, Ordering::SeqCst)
-        {
+        match progress.downloaded_bytes.compare_exchange(
+            current,
+            next,
+            Ordering::SeqCst,
+            Ordering::SeqCst,
+        ) {
             Ok(_) => break,
             Err(observed) => current = observed,
         }
@@ -99,6 +106,7 @@ async fn verification_worker(
     rx: Receiver<ResourceItem>,
     event_tx: UnboundedSender<PipelineEvent>,
     folder: PathBuf,
+    log_file: SharedLogFile,
     should_stop: Arc<AtomicBool>,
     verify_bar: ProgressBar,
 ) {
@@ -109,28 +117,40 @@ async fn verification_worker(
 
         let expected_size = item.size;
         let local_path = folder.join(item.dest.replace('\\', "/"));
-        let is_valid = check_existing_file_interruptible(
+        let event = match check_existing_file_interruptible(
             &local_path,
             item.md5.as_deref(),
             expected_size,
             should_stop.clone(),
         )
-        .await;
-
-        let event = if is_valid {
-            PipelineEvent::VerifiedValid {
-                completed_bytes: expected_size,
+        .await
+        {
+            Ok(true) => {
+                verify_bar.inc(1);
+                PipelineEvent::VerifiedValid {
+                    completed_bytes: expected_size,
+                }
             }
-        } else {
-            PipelineEvent::NeedDownload(DownloadTask {
-                item,
-                expected_size: expected_size.unwrap_or(0),
-                attempt: 0,
-            })
+            Ok(false) => {
+                verify_bar.inc(1);
+                PipelineEvent::NeedDownload(DownloadTask {
+                    item,
+                    expected_size,
+                    attempt: 0,
+                })
+            }
+            Err(VerificationError::Interrupted) => PipelineEvent::VerificationAborted,
+            Err(VerificationError::Io(err)) => {
+                verify_bar.inc(1);
+                log_error(
+                    &log_file,
+                    &format!("Verification failed for {}: {}", item.dest, err),
+                );
+                PipelineEvent::VerificationFailed { dest: item.dest }
+            }
         };
 
         let _ = event_tx.send(event);
-        verify_bar.inc(1);
     }
 
     if should_stop.load(Ordering::SeqCst) {
@@ -171,7 +191,7 @@ async fn download_worker(
             task_bar.set_message(format!("downloading {}", filename));
         }
 
-        task_bar.set_length(task.expected_size);
+        task_bar.set_length(task.expected_size.unwrap_or(0));
         task_bar.set_position(0);
 
         let ok = download_file(
@@ -180,7 +200,7 @@ async fn download_worker(
             &task.item.dest,
             &folder,
             task.item.md5.as_deref(),
-            Some(task.expected_size),
+            task.expected_size,
             &log_file,
             &should_stop,
             &progress,
@@ -215,7 +235,11 @@ async fn download_worker(
         } else {
             log_error(
                 &log_file,
-                &format!("Download worker {} failed: {}", worker_id + 1, task.item.dest),
+                &format!(
+                    "Download worker {} failed: {}",
+                    worker_id + 1,
+                    task.item.dest
+                ),
             );
             PipelineEvent::DownloadFailed {
                 dest: task.item.dest,
@@ -245,31 +269,43 @@ async fn post_verify_worker(
             break;
         }
 
-        let verified = if let Some(expected_md5) = task.item.md5.as_deref() {
+        let verification = if let Some(expected_md5) = task.item.md5.as_deref() {
             match calculate_md5_interruptible(&path, should_stop.clone()).await {
-                Ok(actual_md5) => actual_md5 == expected_md5,
-                Err(err) => {
-                    if !should_stop.load(Ordering::SeqCst) {
-                        log_error(
-                            &log_file,
-                            &format!(
-                                "Post-verify worker {} checksum calculation failed for {}: {}",
-                                worker_id + 1,
-                                task.item.dest,
-                                err
-                            ),
-                        );
-                    }
-                    false
-                }
+                Ok(actual_md5) => Ok(actual_md5 == expected_md5),
+                Err(err) => Err(err),
+            }
+        } else if let Some(expected_size) = task.expected_size {
+            match tokio::fs::metadata(&path).await {
+                Ok(metadata) => Ok(metadata.len() == expected_size),
+                Err(err) => Err(VerificationError::Io(err)),
             }
         } else {
-            true
+            Ok(true)
         };
 
-        if verified {
-            let _ = event_tx.send(PipelineEvent::PostVerifySuccess);
-            continue;
+        match verification {
+            Ok(true) => {
+                let _ = event_tx.send(PipelineEvent::PostVerifySuccess);
+                continue;
+            }
+            Err(VerificationError::Interrupted) => {
+                let _ = event_tx.send(PipelineEvent::PostVerifyAborted);
+                continue;
+            }
+            Err(VerificationError::Io(err)) => {
+                log_error(
+                    &log_file,
+                    &format!(
+                        "Post-verify worker {} failed for {}: {}",
+                        worker_id + 1,
+                        task.item.dest,
+                        err
+                    ),
+                );
+                let _ = event_tx.send(PipelineEvent::PostVerifyIoFailed { dest: filename });
+                continue;
+            }
+            Ok(false) => {}
         }
 
         if should_stop.load(Ordering::SeqCst) {
@@ -277,7 +313,7 @@ async fn post_verify_worker(
             continue;
         }
 
-        let bytes_to_rollback = file_size(&path).await.min(task.expected_size);
+        let bytes_to_rollback = file_size(&path).await;
         rollback_completed_bytes(&progress, &display.total_bar, bytes_to_rollback);
         remove_file_if_exists(&path).await;
 
@@ -362,8 +398,10 @@ pub async fn run_pipeline(
         start_time: Instant::now(),
     };
 
-    let (event_tx, mut event_rx): (UnboundedSender<PipelineEvent>, UnboundedReceiver<PipelineEvent>) =
-        mpsc::unbounded_channel();
+    let (event_tx, mut event_rx): (
+        UnboundedSender<PipelineEvent>,
+        UnboundedReceiver<PipelineEvent>,
+    ) = mpsc::unbounded_channel();
     let (verify_tx, verify_rx) = async_channel::unbounded();
     let (download_tx, download_rx) = async_channel::unbounded();
     let (post_verify_tx, post_verify_rx) = async_channel::unbounded();
@@ -374,6 +412,7 @@ pub async fn run_pipeline(
             verify_rx.clone(),
             event_tx.clone(),
             folder.clone(),
+            log_file.clone(),
             should_stop.clone(),
             display.verify_bar.clone(),
         )));
@@ -427,7 +466,7 @@ pub async fn run_pipeline(
             break;
         }
         let event = PipelineEvent::NeedDownload(DownloadTask {
-            expected_size: item.size.unwrap_or(0),
+            expected_size: item.size,
             item,
             attempt: 0,
         });
@@ -494,6 +533,13 @@ pub async fn run_pipeline(
                             active_tasks = active_tasks.saturating_sub(1);
                         }
                     }
+                    PipelineEvent::VerificationFailed { dest } => {
+                        let _ = dest;
+                        result.failed += 1;
+                        active_tasks = active_tasks.saturating_sub(1);
+                    }
+                    PipelineEvent::VerificationAborted => {
+                    }
                     PipelineEvent::DownloadSuccess(task) => {
                         if shutting_down {
                             continue;
@@ -526,6 +572,11 @@ pub async fn run_pipeline(
                         }
                     }
                     PipelineEvent::PostVerifyFailed { dest } => {
+                        let _ = dest;
+                        result.failed += 1;
+                        active_tasks = active_tasks.saturating_sub(1);
+                    }
+                    PipelineEvent::PostVerifyIoFailed { dest } => {
                         let _ = dest;
                         result.failed += 1;
                         active_tasks = active_tasks.saturating_sub(1);
@@ -565,11 +616,15 @@ pub async fn run_pipeline(
 
     if stopped {
         display.status_bar.finish_with_message("stopped");
-        display.verify_bar.finish_with_message("verification stopped");
+        display
+            .verify_bar
+            .finish_with_message("verification stopped");
         display.total_bar.finish_with_message("download stopped");
     } else {
         display.status_bar.finish_with_message("completed");
-        display.verify_bar.finish_with_message("verification complete");
+        display
+            .verify_bar
+            .finish_with_message("verification complete");
         display.total_bar.finish_with_message("download complete");
     }
 
