@@ -16,6 +16,8 @@ pub enum VerificationError {
     Io(io::Error),
 }
 
+const CHECKSUM_CANCELLATION_ERROR: &str = "Checksum calculation cancelled";
+
 fn calculate_md5_sync(path: &Path) -> io::Result<String> {
     calculate_md5_sync_interruptible(path, None)
 }
@@ -33,13 +35,14 @@ fn calculate_md5_sync_interruptible(
         if let Some(should_stop) = &should_stop
             && should_stop.load(Ordering::SeqCst)
         {
-            return Err(io::Error::new(
-                io::ErrorKind::Interrupted,
-                "Checksum calculation interrupted",
-            ));
+            return Err(io::Error::other(CHECKSUM_CANCELLATION_ERROR));
         }
 
-        let read = reader.read(&mut buffer)?;
+        let read = match reader.read(&mut buffer) {
+            Ok(read) => read,
+            Err(err) if err.kind() == io::ErrorKind::Interrupted => continue,
+            Err(err) => return Err(err),
+        };
         if read == 0 {
             break;
         }
@@ -70,7 +73,9 @@ pub async fn calculate_md5_interruptible(
         VerificationError::Io(io::Error::other(format!("Failed to join MD5 task: {}", e)))
     })?
     .map_err(|e| match e.kind() {
-        io::ErrorKind::Interrupted => VerificationError::Interrupted,
+        io::ErrorKind::Other if e.to_string() == CHECKSUM_CANCELLATION_ERROR => {
+            VerificationError::Interrupted
+        }
         _ => VerificationError::Io(io::Error::new(
             e.kind(),
             format!("Failed to calculate MD5: {}", e),
@@ -91,7 +96,9 @@ pub async fn check_existing_file(
     if let Some(size) = expected_size
         && metadata.len() != size
     {
-        let _ = tokio::fs::remove_file(path).await;
+        if metadata.len() > size {
+            let _ = tokio::fs::remove_file(path).await;
+        }
         return true;
     }
 
@@ -123,9 +130,11 @@ pub async fn check_existing_file_interruptible(
     if let Some(size) = expected_size
         && metadata.len() != size
     {
-        tokio::fs::remove_file(path)
-            .await
-            .map_err(VerificationError::Io)?;
+        if metadata.len() > size {
+            tokio::fs::remove_file(path)
+                .await
+                .map_err(VerificationError::Io)?;
+        }
         return Ok(true);
     }
 
@@ -166,13 +175,13 @@ pub fn get_dir() -> Result<PathBuf, io::Error> {
             "{} Please specify the directory where the game should be downloaded (press Enter to use the current directory): ",
             Status::question()
         );
-        io::stdout().flush().unwrap();
+        io::stdout().flush()?;
 
         let input = read_line()?;
         let path = input.trim();
 
         let path = if path.is_empty() {
-            std::env::current_dir().unwrap()
+            std::env::current_dir()?
         } else {
             PathBuf::from(shellexpand::tilde(path).into_owned())
         };
@@ -185,12 +194,12 @@ pub fn get_dir() -> Result<PathBuf, io::Error> {
             "{} Directory does not exist. Create? (y/n): ",
             Status::warning()
         );
-        io::stdout().flush().unwrap();
+        io::stdout().flush()?;
 
         let input = read_line()?;
 
         if input.trim().eq_ignore_ascii_case("y") {
-            fs::create_dir_all(&path).unwrap();
+            fs::create_dir_all(&path)?;
             return Ok(path);
         }
     }
@@ -231,7 +240,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn check_existing_file_interruptible_returns_true_and_deletes_for_size_mismatch() {
+    async fn check_existing_file_interruptible_returns_true_and_keeps_undersized_file() {
         let path = unique_path("size-mismatch");
         fs::write(&path, b"abc").unwrap();
 
@@ -239,6 +248,25 @@ mod tests {
             &path,
             None,
             Some(4),
+            Arc::new(AtomicBool::new(false)),
+        )
+        .await
+        .unwrap();
+
+        assert!(result);
+        assert!(path.exists());
+        let _ = fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn check_existing_file_interruptible_returns_true_and_deletes_oversized_file() {
+        let path = unique_path("oversized");
+        fs::write(&path, b"abcd").unwrap();
+
+        let result = check_existing_file_interruptible(
+            &path,
+            None,
+            Some(3),
             Arc::new(AtomicBool::new(false)),
         )
         .await

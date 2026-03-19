@@ -686,7 +686,7 @@ pub async fn get_config(client: &Client) -> Result<Config, String> {
     let mut cdn_urls = Vec::new();
     let mut cdn_list_opt = config_data.get("cdnList").and_then(Value::as_array);
 
-    if cdn_list_opt.is_none() || cdn_list_opt.unwrap().is_empty() {
+    if cdn_list_opt.as_ref().map_or(true, |list| list.is_empty()) {
         let other_config = if selected_config == "default" {
             "predownload"
         } else {
