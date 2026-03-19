@@ -19,7 +19,7 @@ use winconsole::console::clear;
 use crate::config::cfg::Config;
 use crate::config::status::Status;
 use crate::download::progress::DownloadProgress;
-use crate::io::file::{calculate_md5, file_size, get_filename};
+use crate::io::file::{file_size, get_filename};
 use crate::io::logging::{SharedLogFile, log_error};
 use crate::io::util::{get_version, read_line_interruptible};
 
@@ -402,7 +402,6 @@ pub async fn download_file(
     config: &Config,
     dest: &str,
     folder: &Path,
-    expected_md5: Option<&str>,
     expected_size: Option<u64>,
     log_file: &SharedLogFile,
     should_stop: &std::sync::atomic::AtomicBool,
@@ -425,49 +424,6 @@ pub async fn download_file(
         task_pb.set_length(0);
     }
 
-    // Validate any existing file before deciding whether to resume or restart.
-    let mut force_full_download = false;
-    if let Some(expected) = expected_size {
-        let local_size = file_size(&path).await;
-        if local_size > 0 {
-            if local_size == expected {
-                if let Some(md5) = expected_md5 {
-                    match calculate_md5(&path).await {
-                        Ok(actual) if actual == md5 => {
-                            task_pb.set_position(expected);
-                            task_pb.set_message(format!(
-                                "already valid: {}",
-                                filename.bright_purple()
-                            ));
-                            return true;
-                        }
-                        _ => {
-                            log_error(
-                                log_file,
-                                &format!("Corrupted file detected, deleting: {}", normalized_dest),
-                            );
-                            remove_partial_file(&path).await;
-                            task_pb.set_position(0);
-                            force_full_download = true;
-                        }
-                    }
-                } else {
-                    task_pb.set_position(expected);
-                    task_pb.set_message(format!("already valid: {}", filename.bright_purple()));
-                    return true;
-                }
-            } else if local_size > expected {
-                log_error(
-                    log_file,
-                    &format!("Oversized file detected, deleting: {}", normalized_dest),
-                );
-                remove_partial_file(&path).await;
-                task_pb.set_position(0);
-                force_full_download = true;
-            }
-        }
-    }
-
     if let Some(parent) = path.parent()
         && let Err(e) = tokio::fs::create_dir_all(parent).await
     {
@@ -479,7 +435,6 @@ pub async fn download_file(
         return false;
     }
 
-    let allow_resume = !force_full_download;
     let first_pass = try_download_with_cdns(
         client,
         config,
@@ -490,7 +445,7 @@ pub async fn download_file(
         progress,
         total_pb,
         task_pb,
-        allow_resume,
+        true,
         &mut counted_bytes_for_file,
     )
     .await;

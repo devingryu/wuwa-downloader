@@ -92,13 +92,13 @@ async fn verification_worker(
         )
         .await
         {
-            Ok(true) => {
+            Ok(false) => {
                 verify_bar.inc(1);
                 PipelineEvent::VerifiedValid {
                     completed_bytes: expected_size,
                 }
             }
-            Ok(false) => {
+            Ok(true) => {
                 verify_bar.inc(1);
                 PipelineEvent::NeedDownload(DownloadTask {
                     item,
@@ -166,7 +166,6 @@ async fn download_worker(
             &config,
             &task.item.dest,
             &folder,
-            task.item.md5.as_deref(),
             task.expected_size,
             &log_file,
             &should_stop,

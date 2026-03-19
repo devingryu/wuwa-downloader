@@ -85,23 +85,27 @@ pub async fn check_existing_file(
 ) -> bool {
     let metadata = match tokio::fs::metadata(path).await {
         Ok(metadata) => metadata,
-        Err(_) => return false,
+        Err(_) => return true,
     };
 
     if let Some(size) = expected_size
         && metadata.len() != size
     {
-        return false;
+        let _ = tokio::fs::remove_file(path).await;
+        return true;
     }
 
     if let Some(md5) = expected_md5 {
         match calculate_md5(path).await {
             Ok(actual_md5) if actual_md5 == md5 => {}
-            _ => return false,
+            _ => {
+                let _ = tokio::fs::remove_file(path).await;
+                return true;
+            }
         }
     }
 
-    true
+    false
 }
 
 pub async fn check_existing_file_interruptible(
@@ -112,25 +116,33 @@ pub async fn check_existing_file_interruptible(
 ) -> Result<bool, VerificationError> {
     let metadata = match tokio::fs::metadata(path).await {
         Ok(metadata) => metadata,
-        Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(false),
+        Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(true),
         Err(err) => return Err(VerificationError::Io(err)),
     };
 
     if let Some(size) = expected_size
         && metadata.len() != size
     {
-        return Ok(false);
+        tokio::fs::remove_file(path)
+            .await
+            .map_err(VerificationError::Io)?;
+        return Ok(true);
     }
 
     if let Some(md5) = expected_md5 {
         match calculate_md5_interruptible(path, should_stop).await {
             Ok(actual_md5) if actual_md5 == md5 => {}
-            Ok(_) => return Ok(false),
+            Ok(_) => {
+                tokio::fs::remove_file(path)
+                    .await
+                    .map_err(VerificationError::Io)?;
+                return Ok(true);
+            }
             Err(err) => return Err(err),
         }
     }
 
-    Ok(true)
+    Ok(false)
 }
 
 pub async fn file_size(path: &Path) -> u64 {
@@ -202,7 +214,24 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn check_existing_file_interruptible_returns_false_for_size_mismatch() {
+    async fn check_existing_file_interruptible_returns_true_for_missing_file() {
+        let path = unique_path("missing");
+
+        let result = check_existing_file_interruptible(
+            &path,
+            None,
+            Some(4),
+            Arc::new(AtomicBool::new(false)),
+        )
+        .await
+        .unwrap();
+
+        assert!(result);
+        assert!(!path.exists());
+    }
+
+    #[tokio::test]
+    async fn check_existing_file_interruptible_returns_true_and_deletes_for_size_mismatch() {
         let path = unique_path("size-mismatch");
         fs::write(&path, b"abc").unwrap();
 
@@ -215,12 +244,12 @@ mod tests {
         .await
         .unwrap();
 
-        assert!(!result);
-        let _ = fs::remove_file(path);
+        assert!(result);
+        assert!(!path.exists());
     }
 
     #[tokio::test]
-    async fn check_existing_file_interruptible_returns_false_for_checksum_mismatch() {
+    async fn check_existing_file_interruptible_returns_true_and_deletes_for_checksum_mismatch() {
         let path = unique_path("checksum-mismatch");
         fs::write(&path, b"abc").unwrap();
 
@@ -233,7 +262,26 @@ mod tests {
         .await
         .unwrap();
 
+        assert!(result);
+        assert!(!path.exists());
+    }
+
+    #[tokio::test]
+    async fn check_existing_file_interruptible_returns_false_for_valid_file() {
+        let path = unique_path("valid");
+        fs::write(&path, b"abc").unwrap();
+
+        let result = check_existing_file_interruptible(
+            &path,
+            Some("900150983cd24fb0d6963f7d28e17f72"),
+            Some(3),
+            Arc::new(AtomicBool::new(false)),
+        )
+        .await
+        .unwrap();
+
         assert!(!result);
+        assert!(path.exists());
         let _ = fs::remove_file(path);
     }
 
