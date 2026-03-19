@@ -38,18 +38,12 @@ pub fn parse_resources(data: &Value) -> Result<Vec<ResourceItem>, String> {
     Ok(parsed)
 }
 
-pub fn ask_concurrency(should_stop: &AtomicBool) -> Result<DownloadOptions, io::Error> {
+pub fn ask_concurrency() -> Result<DownloadOptions, io::Error> {
     let defaults = DownloadOptions::default();
-    let download_concurrency = prompt_concurrency(
-        "concurrent downloads",
-        defaults.download_concurrency,
-        should_stop,
-    )?;
-    let verify_concurrency = prompt_concurrency(
-        "concurrent verifications",
-        defaults.verify_concurrency,
-        should_stop,
-    )?;
+    let download_concurrency =
+        prompt_concurrency("concurrent downloads", defaults.download_concurrency)?;
+    let verify_concurrency =
+        prompt_concurrency("concurrent verifications", defaults.verify_concurrency)?;
 
     Ok(DownloadOptions {
         download_concurrency,
@@ -69,11 +63,7 @@ fn clamp_worker_count(value: usize, default_value: usize) -> usize {
     value.min(worker_count_limit(default_value))
 }
 
-fn prompt_concurrency(
-    label: &str,
-    default_value: usize,
-    should_stop: &AtomicBool,
-) -> Result<usize, io::Error> {
+fn prompt_concurrency(label: &str, default_value: usize) -> Result<usize, io::Error> {
     print!(
         "{} Enter {} [default {}]: ",
         Status::question(),
@@ -82,7 +72,7 @@ fn prompt_concurrency(
     );
     io::stdout().flush().unwrap();
 
-    let input = read_line_interruptible(should_stop)?;
+    let input = read_line()?;
     let trimmed = input.trim();
     if trimmed.is_empty() {
         return Ok(default_value);
@@ -112,6 +102,12 @@ fn prompt_concurrency(
         label
     );
     Ok(default_value)
+}
+
+pub fn read_line() -> Result<String, io::Error> {
+    let mut input = String::new();
+    io::stdin().read_line(&mut input)?;
+    Ok(input)
 }
 
 pub fn read_line_interruptible(should_stop: &AtomicBool) -> Result<String, io::Error> {

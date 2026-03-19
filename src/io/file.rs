@@ -8,7 +8,7 @@ use std::{
 };
 
 use crate::config::status::Status;
-use crate::io::util::read_line_interruptible;
+use crate::io::util::read_line;
 
 #[derive(Debug)]
 pub enum VerificationError {
@@ -160,7 +160,7 @@ pub fn get_filename(path: &str) -> String {
         .to_string()
 }
 
-pub fn get_dir(should_stop: &AtomicBool) -> Result<PathBuf, io::Error> {
+pub fn get_dir() -> Result<PathBuf, io::Error> {
     loop {
         print!(
             "{} Please specify the directory where the game should be downloaded (press Enter to use the current directory): ",
@@ -168,7 +168,7 @@ pub fn get_dir(should_stop: &AtomicBool) -> Result<PathBuf, io::Error> {
         );
         io::stdout().flush().unwrap();
 
-        let input = read_line_interruptible(should_stop)?;
+        let input = read_line()?;
         let path = input.trim();
 
         let path = if path.is_empty() {
@@ -187,7 +187,7 @@ pub fn get_dir(should_stop: &AtomicBool) -> Result<PathBuf, io::Error> {
         );
         io::stdout().flush().unwrap();
 
-        let input = read_line_interruptible(should_stop)?;
+        let input = read_line()?;
 
         if input.trim().eq_ignore_ascii_case("y") {
             fs::create_dir_all(&path).unwrap();

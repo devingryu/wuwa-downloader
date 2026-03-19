@@ -21,7 +21,7 @@ use crate::config::status::Status;
 use crate::download::progress::DownloadProgress;
 use crate::io::file::{file_size, get_filename};
 use crate::io::logging::{SharedLogFile, log_error};
-use crate::io::util::{get_version, read_line_interruptible};
+use crate::io::util::{get_version, read_line};
 
 const INDEX_URL: &str = "https://gist.githubusercontent.com/yuhkix/b8796681ac2cd3bab11b7e8cdc022254/raw/4435fd290c07f7f766a6d2ab09ed3096d83b02e3/wuwa.json";
 const MAX_RETRIES: usize = 3;
@@ -63,10 +63,6 @@ pub fn build_download_url(base_url: &str, dest: &str) -> String {
     )
 }
 
-fn interrupted_error(stage: &str) -> String {
-    format!("Interrupted while {}", stage)
-}
-
 async fn decompress_if_gzipped(response: reqwest::Response) -> Result<String, String> {
     response
         .text()
@@ -78,18 +74,15 @@ pub async fn fetch_index(
     client: &Client,
     config: &Config,
     log_file: &SharedLogFile,
-    should_stop: &AtomicBool,
 ) -> Result<Value, String> {
     println!("{} Fetching index file...", Status::info());
 
-    let response = match tokio::select! {
-        _ = wait_for_stop(should_stop) => return Err(interrupted_error("fetching the index file")),
-        resp = client
+    let response = match client
         .get(&config.index_url)
         .timeout(Duration::from_secs(30))
         .send()
-        => resp,
-    } {
+        .await
+    {
         Ok(resp) => resp,
         Err(e) => {
             let msg = format!("Error fetching index file: {}", e);
@@ -104,10 +97,7 @@ pub async fn fetch_index(
         return Err(msg);
     }
 
-    let text = match tokio::select! {
-        _ = wait_for_stop(should_stop) => return Err(interrupted_error("processing the index file")),
-        text = decompress_if_gzipped(response) => text,
-    } {
+    let text = match decompress_if_gzipped(response).await {
         Ok(t) => t,
         Err(e) => {
             let msg = format!("Error processing index file: {}", e);
@@ -510,7 +500,7 @@ pub async fn download_file(
     true
 }
 
-pub fn ask_download_mode(_client: &Client, should_stop: &AtomicBool) -> Result<String, String> {
+pub fn ask_download_mode(_client: &Client) -> Result<String, String> {
     println!("\n{} Download Mode Selection", Status::info());
     println!(
         "{} 1. Latest game versions (from official sources)",
@@ -527,8 +517,7 @@ pub fn ask_download_mode(_client: &Client, should_stop: &AtomicBool) -> Result<S
             .flush()
             .map_err(|e| format!("Failed to flush stdout: {}", e))?;
 
-        let input = read_line_interruptible(should_stop)
-            .map_err(|e| format!("Failed to read input: {}", e))?;
+        let input = read_line().map_err(|e| format!("Failed to read input: {}", e))?;
 
         match input.trim() {
             "1" => return Ok("latest".to_string()),
@@ -538,7 +527,7 @@ pub fn ask_download_mode(_client: &Client, should_stop: &AtomicBool) -> Result<S
     }
 }
 
-pub fn get_custom_config(_client: &Client, should_stop: &AtomicBool) -> Result<Config, String> {
+pub fn get_custom_config(_client: &Client) -> Result<Config, String> {
     println!("\n{} Custom Version Configuration", Status::info());
 
     print!("{} Enter resource.json URL: ", Status::question());
@@ -546,8 +535,7 @@ pub fn get_custom_config(_client: &Client, should_stop: &AtomicBool) -> Result<C
         .flush()
         .map_err(|e| format!("Failed to flush stdout: {}", e))?;
 
-    let index_url =
-        read_line_interruptible(should_stop).map_err(|e| format!("Failed to read input: {}", e))?;
+    let index_url = read_line().map_err(|e| format!("Failed to read input: {}", e))?;
 
     let index_url = index_url.trim();
     if index_url.is_empty() {
@@ -568,8 +556,7 @@ pub fn get_custom_config(_client: &Client, should_stop: &AtomicBool) -> Result<C
         .flush()
         .map_err(|e| format!("Failed to flush stdout: {}", e))?;
 
-    let base_url =
-        read_line_interruptible(should_stop).map_err(|e| format!("Failed to read input: {}", e))?;
+    let base_url = read_line().map_err(|e| format!("Failed to read input: {}", e))?;
 
     let base_url = base_url.trim().to_string();
     if base_url.is_empty() {
@@ -595,27 +582,24 @@ pub fn get_custom_config(_client: &Client, should_stop: &AtomicBool) -> Result<C
     })
 }
 
-pub async fn get_config(client: &Client, should_stop: &AtomicBool) -> Result<Config, String> {
-    let mode = ask_download_mode(client, should_stop)?;
+pub async fn get_config(client: &Client) -> Result<Config, String> {
+    let mode = ask_download_mode(client)?;
 
     if mode == "custom" {
-        return get_custom_config(client, should_stop);
+        return get_custom_config(client);
     }
 
-    let selected_index_url = fetch_gist(client, should_stop).await?;
+    let selected_index_url = fetch_gist(client).await?;
 
     clear_screen();
     println!("{} Fetching download configuration...", Status::info());
 
-    let response = tokio::select! {
-        _ = wait_for_stop(should_stop) => return Err(interrupted_error("fetching the download configuration")),
-        resp = client
+    let response = client
         .get(&selected_index_url)
         .timeout(Duration::from_secs(30))
         .send()
-        => resp,
-    }
-    .map_err(|e| format!("Network error: {}", e))?;
+        .await
+        .map_err(|e| format!("Network error: {}", e))?;
 
     if !response.status().is_success() {
         return Err(format!("Server error: HTTP {}", response.status()));
@@ -645,8 +629,7 @@ pub async fn get_config(client: &Client, should_stop: &AtomicBool) -> Result<Con
                 .flush()
                 .map_err(|e| format!("Failed to flush stdout: {}", e))?;
 
-            let input = read_line_interruptible(should_stop)
-                .map_err(|e| format!("Failed to read input: {}", e))?;
+            let input = read_line().map_err(|e| format!("Failed to read input: {}", e))?;
 
             match input.trim() {
                 "1" => break "default",
@@ -708,8 +691,8 @@ pub async fn get_config(client: &Client, should_stop: &AtomicBool) -> Result<Con
                             .flush()
                             .map_err(|e| format!("Failed to flush stdout: {}", e))?;
 
-                        let input = read_line_interruptible(should_stop)
-                            .map_err(|e| format!("Failed to read input: {}", e))?;
+                        let input =
+                            read_line().map_err(|e| format!("Failed to read input: {}", e))?;
 
                         match input.trim().to_lowercase().as_str() {
                             "y" | "yes" | "" => {
@@ -745,8 +728,7 @@ pub async fn get_config(client: &Client, should_stop: &AtomicBool) -> Result<Con
             .flush()
             .map_err(|e| format!("Failed to flush stdout: {}", e))?;
 
-        let input = read_line_interruptible(should_stop)
-            .map_err(|e| format!("Failed to read input: {}", e))?;
+        let input = read_line().map_err(|e| format!("Failed to read input: {}", e))?;
 
         cdn_urls = input
             .trim()
@@ -772,16 +754,13 @@ pub async fn get_config(client: &Client, should_stop: &AtomicBool) -> Result<Con
     })
 }
 
-pub async fn fetch_gist(client: &Client, should_stop: &AtomicBool) -> Result<String, String> {
-    let response = tokio::select! {
-        _ = wait_for_stop(should_stop) => return Err(interrupted_error("fetching the version list")),
-        resp = client
+pub async fn fetch_gist(client: &Client) -> Result<String, String> {
+    let response = client
         .get(INDEX_URL)
         .timeout(Duration::from_secs(30))
         .send()
-        => resp,
-    }
-    .map_err(|e| format!("Network error: {}", e))?;
+        .await
+        .map_err(|e| format!("Network error: {}", e))?;
 
     if !response.status().is_success() {
         return Err(format!("Server error: HTTP {}", response.status()));
@@ -804,10 +783,12 @@ pub async fn fetch_gist(client: &Client, should_stop: &AtomicBool) -> Result<Str
     for (i, (cat, ver, label)) in entries.iter().enumerate() {
         let index_url = get_version(&gist_data, cat, ver)?;
 
-        let resp = match tokio::select! {
-            _ = wait_for_stop(should_stop) => return Err(interrupted_error("loading version metadata")),
-            resp = client.get(&index_url).timeout(Duration::from_secs(30)).send() => resp,
-        } {
+        let resp = match client
+            .get(&index_url)
+            .timeout(Duration::from_secs(30))
+            .send()
+            .await
+        {
             Ok(resp) => resp,
             Err(e) => {
                 println!("{} Failed to fetch {}: {}", Status::warning(), index_url, e);
@@ -837,8 +818,7 @@ pub async fn fetch_gist(client: &Client, should_stop: &AtomicBool) -> Result<Str
         print!("{} Select version: ", Status::question());
         io::stdout().flush().unwrap();
 
-        let input = read_line_interruptible(should_stop)
-            .map_err(|e| format!("Failed to read input: {}", e))?;
+        let input = read_line().map_err(|e| format!("Failed to read input: {}", e))?;
 
         match input.trim() {
             "1" => return get_version(&gist_data, "live", "os"),
