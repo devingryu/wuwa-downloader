@@ -23,6 +23,8 @@ High-performance, resilient downloader for Wuthering Waves with multi-CDN fallba
 
 ![Ferris](https://i.ibb.co/QVThVkd/Ferris.png)
 
+![](https://count.getloli.com/@wuwa-downloader?name=wuwa-downloader&theme=asoul&padding=1&offset=3&align=center&scale=1&pixelated=0&darkmode=auto)
+
 </div>
 
 ## ✨ Features
