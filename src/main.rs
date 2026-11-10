@@ -99,14 +99,25 @@ async fn main() {
         options.verify_concurrency.to_string().cyan()
     );
 
-    let data = match fetch_index(&client, &config, &log_file).await {
-        Ok(data) => data,
-        Err(e) => exit_with_error(&log_file, &e),
-    };
-    let resources = match parse_resources(&data) {
-        Ok(resources) => resources,
-        Err(err) => exit_with_error(&log_file, &err),
-    };
+    let mut resources = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    for (pack_idx, pack) in config.packs.iter().enumerate() {
+        println!("{} Resource pack: {}", Status::info(), pack.name.cyan());
+        let data = match fetch_index(&client, &pack.index_url, &log_file).await {
+            Ok(data) => data,
+            Err(e) => exit_with_error(&log_file, &e),
+        };
+        let pack_resources = match parse_resources(&data, pack_idx) {
+            Ok(resources) => resources,
+            Err(err) => exit_with_error(&log_file, &format!("{} ({})", err, pack.name)),
+        };
+        // Packs in one bundle should be disjoint; if a path repeats, the first pack wins.
+        resources.extend(
+            pack_resources
+                .into_iter()
+                .filter(|item| seen.insert(item.dest.replace('\\', "/"))),
+        );
+    }
 
     println!(
         "{} Found {} files to download\n",

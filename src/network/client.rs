@@ -11,7 +11,7 @@ use std::{
 use tokio::io::AsyncWriteExt;
 use tokio::time::sleep;
 
-use crate::config::cfg::Config;
+use crate::config::cfg::{Config, PackSource};
 use crate::config::status::Status;
 use crate::download::progress::DownloadProgress;
 use crate::io::file::{file_size, get_filename};
@@ -19,6 +19,7 @@ use crate::io::logging::{SharedLogFile, log_error};
 use crate::io::util::{clear_screen, get_version, read_line};
 
 const INDEX_URL: &str = "https://gist.githubusercontent.com/yuhkix/b8796681ac2cd3bab11b7e8cdc022254/raw/4435fd290c07f7f766a6d2ab09ed3096d83b02e3/wuwa.json";
+const LIVE_OS_INDEX_URL: &str = "https://prod-alicdn-gamestarter.kurogame.com/launcher/game/50004_P7xcUZnEr1AXIGON25E6KjpOgTlVrg6e/G153/official/index.json";
 const MAX_RETRIES: usize = 3;
 const DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(10_000);
 
@@ -55,13 +56,13 @@ async fn decompress_if_gzipped(response: reqwest::Response) -> Result<String, St
 
 pub async fn fetch_index(
     client: &Client,
-    config: &Config,
+    index_url: &str,
     log_file: &SharedLogFile,
 ) -> Result<Value, String> {
     println!("{} Fetching index file...", Status::info());
 
     let response = match client
-        .get(&config.index_url)
+        .get(index_url)
         .timeout(Duration::from_secs(30))
         .send()
         .await
@@ -262,7 +263,7 @@ async fn download_single_file(
 #[allow(clippy::too_many_arguments)]
 async fn try_download_with_cdns(
     client: &Client,
-    config: &Config,
+    zip_bases: &[String],
     dest: &str,
     path: &Path,
     log_file: &SharedLogFile,
@@ -277,7 +278,7 @@ async fn try_download_with_cdns(
     let mut saw_range_unsupported = false;
     let mut last_error = "Unknown error".to_string();
 
-    for (i, base_url) in config.zip_bases.iter().enumerate() {
+    for (i, base_url) in zip_bases.iter().enumerate() {
         if should_stop.load(std::sync::atomic::Ordering::SeqCst) {
             return CdnDownloadResult::Interrupted;
         }
@@ -391,6 +392,7 @@ async fn try_download_with_cdns(
 pub async fn download_file(
     client: &Client,
     config: &Config,
+    pack: usize,
     dest: &str,
     folder: &Path,
     expected_size: Option<u64>,
@@ -403,6 +405,14 @@ pub async fn download_file(
     if should_stop.load(std::sync::atomic::Ordering::SeqCst) {
         return false;
     }
+
+    let Some(zip_bases) = config.packs.get(pack).map(|p| p.zip_bases.as_slice()) else {
+        log_error(
+            log_file,
+            &format!("Unknown resource pack {} for {}", pack, dest),
+        );
+        return false;
+    };
 
     let normalized_dest = dest.replace('\\', "/");
     let path = folder.join(&normalized_dest);
@@ -429,7 +439,7 @@ pub async fn download_file(
 
     let first_pass = try_download_with_cdns(
         client,
-        config,
+        zip_bases,
         &normalized_dest,
         &path,
         log_file,
@@ -457,7 +467,7 @@ pub async fn download_file(
 
             match try_download_with_cdns(
                 client,
-                config,
+                zip_bases,
                 &normalized_dest,
                 &path,
                 log_file,
@@ -581,8 +591,301 @@ pub fn get_custom_config(_client: &Client) -> Result<Config, String> {
 
     println!("\n{} Configuration loaded successfully", Status::success());
     Ok(Config {
-        index_url,
-        zip_bases: vec![base_url],
+        packs: vec![PackSource {
+            name: "custom".to_string(),
+            index_url,
+            zip_bases: vec![base_url],
+        }],
+    })
+}
+
+fn prompt_choice(prompt: &str, max: usize) -> Result<usize, String> {
+    loop {
+        print!("{} {} (1-{}): ", Status::question(), prompt, max);
+        io::stdout()
+            .flush()
+            .map_err(|e| format!("Failed to flush stdout: {}", e))?;
+
+        let input = read_line().map_err(|e| format!("Failed to read input: {}", e))?;
+        match input.trim().parse::<usize>() {
+            Ok(n) if (1..=max).contains(&n) => return Ok(n - 1),
+            _ => println!("{} Invalid choice, please enter 1-{}", Status::error(), max),
+        }
+    }
+}
+
+async fn fetch_json(client: &Client, url: &str) -> Result<Value, String> {
+    let response = client
+        .get(url)
+        .timeout(Duration::from_secs(30))
+        .send()
+        .await
+        .map_err(|e| format!("Network error: {}", e))?;
+
+    if !response.status().is_success() {
+        return Err(format!("Server error: HTTP {}", response.status()));
+    }
+
+    let text = decompress_if_gzipped(response).await?;
+    from_str(&text).map_err(|e| format!("Invalid JSON: {}", e))
+}
+
+fn cdn_urls_from(list: Option<&Value>) -> Vec<String> {
+    list.and_then(Value::as_array)
+        .map(|list| {
+            list.iter()
+                .filter_map(|cdn| cdn.get("url").and_then(Value::as_str))
+                .map(|url| url.trim_end_matches('/').to_string())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn ask_cdn_urls() -> Result<Vec<String>, String> {
+    println!("{} Please enter CDN URLs manually.", Status::info());
+    print!("{} Enter CDN URLs (comma-separated): ", Status::question());
+    io::stdout()
+        .flush()
+        .map_err(|e| format!("Failed to flush stdout: {}", e))?;
+
+    let input = read_line().map_err(|e| format!("Failed to read input: {}", e))?;
+    let urls: Vec<String> = input
+        .trim()
+        .split(',')
+        .map(|s| s.trim().trim_end_matches('/').to_string())
+        .filter(|s| !s.is_empty())
+        .collect();
+
+    if urls.is_empty() {
+        return Err("No valid CDN URLs found".to_string());
+    }
+    Ok(urls)
+}
+
+fn pack_source(name: &str, pack: &Value, cdn_urls: &[String]) -> Result<PackSource, String> {
+    let index_file = pack
+        .get("indexFile")
+        .and_then(Value::as_str)
+        .ok_or_else(|| format!("Missing or invalid indexFile in pack '{}'", name))?;
+    let base_url = pack
+        .get("baseUrl")
+        .and_then(Value::as_str)
+        .ok_or_else(|| format!("Missing or invalid baseUrl in pack '{}'", name))?;
+
+    Ok(PackSource {
+        name: name.to_string(),
+        index_url: build_download_url(&cdn_urls[0], index_file),
+        zip_bases: cdn_urls
+            .iter()
+            .map(|cdn| build_download_url(cdn, base_url))
+            .collect(),
+    })
+}
+
+fn str_at(v: Option<&Value>) -> Option<String> {
+    v.and_then(Value::as_str).map(str::to_string)
+}
+
+/// Version of a resource-pack section: `common`'s, else any pack's.
+fn pack_section_version(section: &Value) -> Option<String> {
+    let packs = section.get("resourcePacks").and_then(Value::as_object)?;
+    packs
+        .get("common")
+        .or_else(|| packs.values().next())
+        .and_then(|p| str_at(p.get("version")))
+}
+
+/// (current, predownload) versions of a launcher index.json, for either schema.
+fn describe_versions(index: &Value) -> (Option<String>, Option<String>) {
+    if index.get("resourcePacks").is_some() {
+        let pre = index.get("predownload").and_then(pack_section_version);
+        return (pack_section_version(index), pre);
+    }
+
+    let legacy = |key: &str| {
+        index.get(key).and_then(|d| {
+            str_at(d.get("config").and_then(|c| c.get("version")))
+                .or_else(|| str_at(d.get("version")))
+        })
+    };
+    (legacy("default"), legacy("predownload"))
+}
+
+/// Resource-pack schema: top-level `cdnList`, `resourcePacks`, `bundles`,
+/// and an optional `predownload: { bundles, resourcePacks }`.
+fn config_from_resource_packs(index: &Value) -> Result<Config, String> {
+    let (current_version, pre_version) = describe_versions(index);
+    let predownload = index
+        .get("predownload")
+        .filter(|p| p.get("resourcePacks").and_then(Value::as_object).is_some());
+
+    let section = match predownload {
+        None => {
+            println!(
+                "{} Using current version ({})",
+                Status::info(),
+                current_version.as_deref().unwrap_or("unknown")
+            );
+            index
+        }
+        Some(pre) => {
+            println!("{} Available configs:", Status::info());
+            println!(
+                "1. Current ({})",
+                current_version.as_deref().unwrap_or("unknown")
+            );
+            println!(
+                "2. Predownload ({})",
+                pre_version.as_deref().unwrap_or("unknown")
+            );
+            match prompt_choice("Choose config", 2)? {
+                0 => index,
+                _ => pre,
+            }
+        }
+    };
+
+    let packs = section
+        .get("resourcePacks")
+        .and_then(Value::as_object)
+        .ok_or("Missing resourcePacks in response")?;
+
+    // predownload carries its own bundles; fall back to the top-level ones.
+    let bundles = section
+        .get("bundles")
+        .or_else(|| index.get("bundles"))
+        .and_then(Value::as_object);
+
+    let mut choices: Vec<(String, Vec<String>)> = Vec::new();
+    if let Some(bundles) = bundles {
+        for (name, bundle) in bundles {
+            let pack_names: Vec<String> = bundle
+                .get("resourcePacks")
+                .and_then(Value::as_array)
+                .map(|a| {
+                    a.iter()
+                        .filter_map(Value::as_str)
+                        .map(str::to_string)
+                        .collect()
+                })
+                .unwrap_or_default();
+            if !pack_names.is_empty() {
+                choices.push((name.clone(), pack_names));
+            }
+        }
+    }
+    choices.sort_by(|a, b| a.0.cmp(&b.0));
+    if choices.is_empty() {
+        // No bundles declared: download every pack.
+        choices.push(("all".to_string(), packs.keys().cloned().collect()));
+    }
+
+    let selected = if choices.len() == 1 {
+        0
+    } else {
+        println!("{} Available bundles:", Status::info());
+        for (i, (name, pack_names)) in choices.iter().enumerate() {
+            let size: u64 = pack_names
+                .iter()
+                .filter_map(|p| {
+                    packs
+                        .get(p)
+                        .and_then(|p| p.get("size"))
+                        .and_then(Value::as_u64)
+                })
+                .sum();
+            println!(
+                "{}. {} [{}] ({:.1} GB)",
+                i + 1,
+                name,
+                pack_names.join(" + "),
+                size as f64 / 1e9
+            );
+        }
+        prompt_choice("Choose bundle", choices.len())?
+    };
+    let (bundle_name, pack_names) = &choices[selected];
+
+    let mut cdn_urls = cdn_urls_from(index.get("cdnList"));
+    if cdn_urls.is_empty() {
+        cdn_urls = ask_cdn_urls()?;
+    }
+
+    let packs = pack_names
+        .iter()
+        .map(|name| {
+            let pack = packs.get(name).ok_or_else(|| {
+                format!(
+                    "Bundle '{}' references missing pack '{}'",
+                    bundle_name, name
+                )
+            })?;
+            pack_source(name, pack, &cdn_urls)
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+
+    println!(
+        "{} Bundle {}: {}",
+        Status::info(),
+        bundle_name,
+        pack_names.join(" + ")
+    );
+    Ok(Config { packs })
+}
+
+/// Legacy schema: `{ default|predownload: { cdnList, config: { baseUrl, indexFile } } }`.
+fn config_from_legacy(index: &Value) -> Result<Config, String> {
+    let has_default = index.get("default").is_some();
+    let has_predownload = index.get("predownload").is_some();
+
+    let selected_config = match (has_default, has_predownload) {
+        (true, false) => "default",
+        (false, true) => "predownload",
+        (true, true) => {
+            println!("{} Available configs:", Status::info());
+            println!("1. default");
+            println!("2. predownload");
+            match prompt_choice("Choose config", 2)? {
+                0 => "default",
+                _ => "predownload",
+            }
+        }
+        (false, false) => {
+            return Err(
+                "Unrecognized index.json: no resourcePacks, default or predownload".to_string(),
+            );
+        }
+    };
+    println!("{} Using {}.config", Status::info(), selected_config);
+
+    let config_data = &index[selected_config];
+    let base_config = config_data
+        .get("config")
+        .ok_or_else(|| format!("Missing config in {} response", selected_config))?;
+
+    let mut cdn_urls = cdn_urls_from(config_data.get("cdnList"));
+    if cdn_urls.is_empty() {
+        let other = if selected_config == "default" {
+            "predownload"
+        } else {
+            "default"
+        };
+        cdn_urls = cdn_urls_from(index.get(other).and_then(|o| o.get("cdnList")));
+        if !cdn_urls.is_empty() {
+            println!(
+                "{} CDN list missing in '{}', using the one from '{}'.",
+                Status::warning(),
+                selected_config,
+                other
+            );
+        }
+    }
+    if cdn_urls.is_empty() {
+        cdn_urls = ask_cdn_urls()?;
+    }
+
+    Ok(Config {
+        packs: vec![pack_source(selected_config, base_config, &cdn_urls)?],
     })
 }
 
@@ -598,180 +901,26 @@ pub async fn get_config(client: &Client) -> Result<Config, String> {
     clear_screen();
     println!("{} Fetching download configuration...", Status::info());
 
-    let response = client
-        .get(&selected_index_url)
-        .timeout(Duration::from_secs(30))
-        .send()
-        .await
-        .map_err(|e| format!("Network error: {}", e))?;
+    let index = fetch_json(client, &selected_index_url).await?;
 
-    if !response.status().is_success() {
-        return Err(format!("Server error: HTTP {}", response.status()));
+    if index.get("resourcePacks").is_some() {
+        config_from_resource_packs(&index)
+    } else {
+        config_from_legacy(&index)
     }
+}
 
-    let config_text = decompress_if_gzipped(response).await?;
-    let config: Value = from_str(&config_text).map_err(|e| format!("Invalid JSON: {}", e))?;
-
-    let has_default = config.get("default").is_some();
-    let has_predownload = config.get("predownload").is_some();
-
-    let selected_config = match (has_default, has_predownload) {
-        (true, false) => {
-            println!("{} Using default.config", Status::info());
-            "default"
-        }
-        (false, true) => {
-            println!("{} Using predownload.config", Status::info());
-            "predownload"
-        }
-        (true, true) => loop {
-            print!(
-                "{} Choose config to use (1=default, 2=predownload): ",
-                Status::question()
-            );
-            io::stdout()
-                .flush()
-                .map_err(|e| format!("Failed to flush stdout: {}", e))?;
-
-            let input = read_line().map_err(|e| format!("Failed to read input: {}", e))?;
-
-            match input.trim() {
-                "1" => break "default",
-                "2" => break "predownload",
-                _ => println!("{} Invalid choice, please enter 1 or 2", Status::error()),
-            }
-        },
-        (false, false) => {
-            return Err(
-                "Neither default.config nor predownload.config found in response".to_string(),
-            );
-        }
-    };
-
-    let config_data = config
-        .get(selected_config)
-        .ok_or_else(|| format!("Missing {} config in response", selected_config))?;
-
-    let base_config = config_data
-        .get("config")
-        .ok_or_else(|| format!("Missing config in {} response", selected_config))?;
-
-    let base_url = base_config
-        .get("baseUrl")
-        .and_then(Value::as_str)
-        .ok_or("Missing or invalid baseUrl")?;
-
-    let index_file = base_config
-        .get("indexFile")
-        .and_then(Value::as_str)
-        .ok_or("Missing or invalid indexFile")?;
-
-    let mut cdn_urls = Vec::new();
-    let mut cdn_list_opt = config_data.get("cdnList").and_then(Value::as_array);
-
-    if cdn_list_opt.as_ref().map_or(true, |list| list.is_empty()) {
-        let other_config = if selected_config == "default" {
-            "predownload"
-        } else {
-            "default"
-        };
-        if let Some(other_data) = config.get(other_config) {
-            if let Some(list) = other_data.get("cdnList").and_then(Value::as_array) {
-                if !list.is_empty() {
-                    println!(
-                        "{} CDN list missing in '{}', but found in '{}'.",
-                        Status::warning(),
-                        selected_config,
-                        other_config
-                    );
-
-                    loop {
-                        print!(
-                            "{} Do you want to use the CDN list from '{}'? [Y/n]: ",
-                            Status::question(),
-                            other_config
-                        );
-                        io::stdout()
-                            .flush()
-                            .map_err(|e| format!("Failed to flush stdout: {}", e))?;
-
-                        let input =
-                            read_line().map_err(|e| format!("Failed to read input: {}", e))?;
-
-                        match input.trim().to_lowercase().as_str() {
-                            "y" | "yes" | "" => {
-                                cdn_list_opt = Some(list);
-                                break;
-                            }
-                            "n" | "no" => {
-                                break;
-                            }
-                            _ => println!(
-                                "{} Invalid choice, please press Enter for Yes, or 'n' for No",
-                                Status::error()
-                            ),
-                        }
-                    }
-                }
-            }
-        }
+/// The upstream gist's live/os entry still serves the legacy schema, frozen at
+/// 3.7.1 with no predownload; the launcher moved to `LIVE_OS_INDEX_URL`.
+fn resolve_index_url(gist_data: &Value, category: &str, version: &str) -> Result<String, String> {
+    match (category, version) {
+        ("live", "os") => Ok(LIVE_OS_INDEX_URL.to_string()),
+        _ => get_version(gist_data, category, version),
     }
-
-    if let Some(cdn_list) = cdn_list_opt {
-        for cdn in cdn_list {
-            if let Some(url) = cdn.get("url").and_then(Value::as_str) {
-                cdn_urls.push(url.trim_end_matches('/').to_string());
-            }
-        }
-    }
-
-    if cdn_urls.is_empty() {
-        println!("{} Please enter CDN URLs manually.", Status::info());
-        print!("{} Enter CDN URLs (comma-separated): ", Status::question());
-        io::stdout()
-            .flush()
-            .map_err(|e| format!("Failed to flush stdout: {}", e))?;
-
-        let input = read_line().map_err(|e| format!("Failed to read input: {}", e))?;
-
-        cdn_urls = input
-            .trim()
-            .split(',')
-            .map(|s| s.trim().trim_end_matches('/').to_string())
-            .filter(|s| !s.is_empty())
-            .collect();
-    }
-
-    if cdn_urls.is_empty() {
-        return Err("No valid CDN URLs found".to_string());
-    }
-
-    let full_index_url = build_download_url(&cdn_urls[0], index_file);
-    let zip_bases = cdn_urls
-        .iter()
-        .map(|cdn| build_download_url(cdn, base_url))
-        .collect();
-
-    Ok(Config {
-        index_url: full_index_url,
-        zip_bases,
-    })
 }
 
 pub async fn fetch_gist(client: &Client) -> Result<String, String> {
-    let response = client
-        .get(INDEX_URL)
-        .timeout(Duration::from_secs(30))
-        .send()
-        .await
-        .map_err(|e| format!("Network error: {}", e))?;
-
-    if !response.status().is_success() {
-        return Err(format!("Server error: HTTP {}", response.status()));
-    }
-
-    let gist_data_text = decompress_if_gzipped(response).await?;
-    let gist_data: Value = from_str(&gist_data_text).map_err(|e| format!("Invalid JSON: {}", e))?;
+    let gist_data = fetch_json(client, INDEX_URL).await?;
 
     clear_screen();
 
@@ -785,51 +934,25 @@ pub async fn fetch_gist(client: &Client) -> Result<String, String> {
     println!("{} Available versions:", Status::info());
 
     for (i, (cat, ver, label)) in entries.iter().enumerate() {
-        let index_url = get_version(&gist_data, cat, ver)?;
+        let index_url = resolve_index_url(&gist_data, cat, ver)?;
 
-        let resp = match client
-            .get(&index_url)
-            .timeout(Duration::from_secs(30))
-            .send()
-            .await
-        {
-            Ok(resp) => resp,
+        let version_json = match fetch_json(client, &index_url).await {
+            Ok(v) => v,
             Err(e) => {
                 println!("{} Failed to fetch {}: {}", Status::warning(), index_url, e);
                 continue;
             }
         };
 
-        let version_json: Value = {
-            let version_text = decompress_if_gzipped(resp)
-                .await
-                .unwrap_or_else(|_| "{}".to_string());
-            from_str(&version_text).unwrap_or(Value::Null)
-        };
-
-        let version = version_json
-            .get("default")
-            .and_then(|d| d.get("config"))
-            .and_then(|c| c.get("version"))
-            .or_else(|| version_json.get("default").and_then(|d| d.get("version")))
-            .and_then(|v| v.as_str())
-            .unwrap_or("unknown");
-
-        println!("{}. {} ({})", i + 1, label, version);
-    }
-
-    loop {
-        print!("{} Select version: ", Status::question());
-        io::stdout().flush().unwrap();
-
-        let input = read_line().map_err(|e| format!("Failed to read input: {}", e))?;
-
-        match input.trim() {
-            "1" => return get_version(&gist_data, "live", "os"),
-            "2" => return get_version(&gist_data, "live", "cn"),
-            "3" => return get_version(&gist_data, "beta", "os"),
-            "4" => return get_version(&gist_data, "beta", "cn"),
-            _ => println!("{} Invalid selection", Status::error()),
+        let (current, pre) = describe_versions(&version_json);
+        let current = current.unwrap_or_else(|| "unknown".to_string());
+        match pre {
+            Some(pre) => println!("{}. {} ({}, predownload {})", i + 1, label, current, pre),
+            None => println!("{}. {} ({})", i + 1, label, current),
         }
     }
+
+    let selected = prompt_choice("Select version", entries.len())?;
+    let (cat, ver, _) = entries[selected];
+    resolve_index_url(&gist_data, cat, ver)
 }

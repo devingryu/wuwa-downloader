@@ -164,6 +164,7 @@ async fn download_worker(
         let ok = download_file(
             &client,
             &config,
+            task.item.pack,
             &task.item.dest,
             &folder,
             task.expected_size,

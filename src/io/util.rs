@@ -18,7 +18,7 @@ use crate::{
     io::logging::{SharedLogFile, log_error},
 };
 
-pub fn parse_resources(data: &Value) -> Result<Vec<ResourceItem>, String> {
+pub fn parse_resources(data: &Value, pack: usize) -> Result<Vec<ResourceItem>, String> {
     let resources = data
         .get("resource")
         .and_then(Value::as_array)
@@ -34,6 +34,7 @@ pub fn parse_resources(data: &Value) -> Result<Vec<ResourceItem>, String> {
                     .and_then(Value::as_str)
                     .map(|md5| md5.to_string()),
                 size: item.get("size").and_then(Value::as_u64),
+                pack,
             });
         }
     }
